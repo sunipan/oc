@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# oc — fuzzy-search opencode sessions and open one
+# Usage:
+#   oc              Interactive fuzzy search (all sessions)
+#   oc <query>      Pre-filtered fuzzy search
+#   oc ls [query]   List sessions (no fzf, plain text)
+#   oc -h | --help  Show help
+#
+# Requires: sqlite3, fzf
+
+set -euo pipefail
+
+DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}"
+PREVIEW_LINES=40
+
+# ── Colors ─────────────────────────────────────────────────────────
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+CYAN=$'\033[0;36m'
+DIM=$'\033[2m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+# ── Helpers ────────────────────────────────────────────────────────
+die() { echo -e "${RED}error:${RESET} $*" >&2; exit 1; }
+
+check_deps() {
+  command -v sqlite3 >/dev/null || die "sqlite3 not found"
+  command -v fzf     >/dev/null || die "fzf not found (brew install fzf)"
+  [[ -f "$DB" ]]               || die "opencode database not found at $DB"
+}
+
+# Format a unix-ms timestamp to relative time (e.g. "2h ago", "3d ago")
+relative_time() {
+  local ts_ms=$1
+  local now_s
+  now_s=$(date +%s)
+  local ts_s=$(( ts_ms / 1000 ))
+  local diff=$(( now_s - ts_s ))
+
+  if   (( diff < 60 ));    then echo "just now"
+  elif (( diff < 3600 ));  then echo "$(( diff / 60 ))m ago"
+  elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h ago"
+  elif (( diff < 604800 )); then echo "$(( diff / 86400 ))d ago"
+  elif (( diff < 2592000 )); then echo "$(( diff / 604800 ))w ago"
+  else echo "$(( diff / 2592000 ))mo ago"
+  fi
+}
+
+# Short directory: replace $HOME with ~, then shorten to last 2 components if long
+short_dir() {
+  local dir="${1/#$HOME/~}"
+  local depth
+  depth=$(echo "$dir" | tr '/' '\n' | wc -l)
+  if (( depth > 4 )); then
+    echo "…/$(echo "$dir" | rev | cut -d'/' -f1-2 | rev)"
+  else
+    echo "$dir"
+  fi
+}
+
+# ── Query ──────────────────────────────────────────────────────────
+# Returns: id | title | directory | time_updated (ms) | project_name | msg_count | slug
+query_sessions() {
+  sqlite3 -separator '|' "$DB" "
+    SELECT
+      s.id,
+      s.title,
+      s.directory,
+      s.time_updated,
+      COALESCE(p.name, ''),
+      (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
+      s.slug
+    FROM session s
+    LEFT JOIN project p ON s.project_id = p.id
+    ORDER BY s.time_updated DESC
+    LIMIT 500;
+  "
+}
+
+# ── Format for fzf ────────────────────────────────────────────────
+# Output: display_line\tsession_id\tdirectory
+format_sessions() {
+  while IFS='|' read -r id title directory time_updated project_name msg_count slug; do
+    local rel
+    rel=$(relative_time "$time_updated")
+    local short
+    short=$(short_dir "$directory")
+
+    # Pad relative time to fixed width for alignment
+    local rel_padded
+    rel_padded=$(printf '%-8s' "$rel")
+
+    # Format: "time  title  dir  msgs"
+    local display
+    display=$(printf '%s  %-60s  %s  (%s msgs)' "$rel_padded" "$title" "$short" "$msg_count")
+
+    # Tab-separate: display \t id \t directory
+    printf '%s\t%s\t%s\n' "$display" "$id" "$directory"
+  done
+}
+
+# ── Preview (shown in fzf preview pane) ───────────────────────────
+session_preview() {
+  local session_id="$1"
+
+  # Session metadata
+  local meta
+  meta=$(sqlite3 -separator '|' "$DB" "
+    SELECT
+      s.id,
+      s.title,
+      s.directory,
+      s.time_created,
+      s.time_updated,
+      COALESCE(p.name, ''),
+      s.slug,
+      s.version,
+      (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id)
+    FROM session s
+    LEFT JOIN project p ON s.project_id = p.id
+    WHERE s.id = '$session_id';
+  ")
+
+  IFS='|' read -r id title directory time_created time_updated project_name slug version msg_count <<< "$meta"
+
+  local created_str updated_str
+  created_str=$(date -r "$(( time_created / 1000 ))" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+  updated_str=$(date -r "$(( time_updated / 1000 ))" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+  local rel
+  rel=$(relative_time "$time_updated")
+
+  echo -e "\033[1;36m$title\033[0m"
+  echo ""
+  echo -e "  \033[2mID:\033[0m        $id"
+  echo -e "  \033[2mSlug:\033[0m      $slug"
+  echo -e "  \033[2mDirectory:\033[0m $directory"
+  echo -e "  \033[2mProject:\033[0m   ${project_name:-—}"
+  echo -e "  \033[2mVersion:\033[0m   $version"
+  echo -e "  \033[2mMessages:\033[0m  $msg_count"
+  echo -e "  \033[2mCreated:\033[0m   $created_str"
+  echo -e "  \033[2mUpdated:\033[0m   $updated_str ($rel)"
+  echo ""
+  echo -e "\033[2m── Last messages ──────────────────────────────\033[0m"
+  echo ""
+
+  # Show last few messages (user messages as context)
+  sqlite3 -separator '|' "$DB" "
+    SELECT
+      m.id,
+      json_extract(m.data, '$.role'),
+      m.time_created
+    FROM message m
+    WHERE m.session_id = '$session_id'
+    ORDER BY m.time_created DESC
+    LIMIT 10;
+  " | while IFS='|' read -r msg_id role msg_time; do
+    # Get the first text part for this message
+    local text
+    text=$(sqlite3 "$DB" "
+      SELECT SUBSTR(
+        COALESCE(
+          json_extract(data, '$.content'),
+          json_extract(data, '$.text'),
+          json_extract(data, '$.value'),
+          ''
+        ), 1, 200)
+      FROM part
+      WHERE message_id = '$msg_id'
+        AND (json_extract(data, '$.type') = 'text'
+             OR json_extract(data, '$.type') IS NULL)
+      LIMIT 1;
+    " 2>/dev/null || echo "")
+
+    if [[ -n "$text" && "$text" != "null" ]]; then
+      local role_color
+      if [[ "$role" == "user" ]]; then
+        role_color="\033[0;32m"  # green
+      else
+        role_color="\033[0;33m"  # yellow
+      fi
+      # Truncate to ~150 chars for preview
+      local short_text="${text:0:150}"
+      [[ ${#text} -gt 150 ]] && short_text="${short_text}…"
+      echo -e "  ${role_color}${role}:${RESET} ${short_text}"
+      echo ""
+    fi
+  done
+}
+
+# ── Commands ──────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<'EOF'
+oc — fuzzy-search opencode sessions and resume one
+
+USAGE
+  oc              Interactive fuzzy search across all sessions
+  oc <query>      Pre-filtered fuzzy search
+  oc ls [query]   List sessions as plain text (no fzf)
+  oc preview <id> Show details for a specific session
+  oc -h, --help   Show this help
+
+KEYBINDINGS (in fzf)
+  Enter           Open session (cd to dir + opencode --session)
+  Ctrl-Y          Copy session ID to clipboard
+  Ctrl-F          Fork session instead of continuing
+
+ENVIRONMENT
+  OPENCODE_DB     Override database path
+                  (default: ~/.local/share/opencode/opencode.db)
+
+EOF
+}
+
+cmd_list() {
+  local filter="${1:-}"
+  check_deps
+
+  query_sessions | while IFS='|' read -r id title directory time_updated project_name msg_count slug; do
+    local rel
+    rel=$(relative_time "$time_updated")
+    local short
+    short=$(short_dir "$directory")
+    local rel_padded
+    rel_padded=$(printf '%-8s' "$rel")
+
+    if [[ -n "$filter" ]]; then
+      # Case-insensitive filter
+      local haystack="${title}|${directory}|${slug}|${project_name}"
+      if ! echo "$haystack" | grep -qi "$filter"; then
+        continue
+      fi
+    fi
+
+    local title_padded
+    title_padded=$(printf '%-55s' "$title")
+    echo -e "${rel_padded}  ${title_padded}  ${short}  (${msg_count} msgs)  ${DIM}${id}${RESET}"
+  done
+}
+
+cmd_search() {
+  local initial_query="${1:-}"
+  check_deps
+
+  # Self-path for preview
+  local self
+  self=$(realpath "$0")
+
+  local selected
+  selected=$(
+    query_sessions \
+    | format_sessions \
+    | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=1 \
+        --query="$initial_query" \
+        --preview="'$self' preview {2}" \
+        --preview-window='right:50%:wrap' \
+        --header='Enter: open │ Ctrl-Y: copy ID │ Ctrl-F: fork' \
+        --bind='ctrl-y:execute-silent(echo -n {2} | pbcopy)+abort' \
+        --expect='ctrl-f' \
+        --color='header:italic,pointer:cyan,marker:cyan,spinner:cyan,prompt:cyan' \
+        --prompt='oc> ' \
+        --height='80%' \
+        --layout=reverse \
+        --info=inline \
+    || true
+  )
+
+  [[ -z "$selected" ]] && exit 0
+
+  # Parse fzf output: first line is the key pressed, second is the selection
+  local key
+  key=$(head -1 <<< "$selected")
+  local line
+  line=$(tail -1 <<< "$selected")
+
+  local session_id
+  session_id=$(echo "$line" | cut -d$'\t' -f2)
+  local directory
+  directory=$(echo "$line" | cut -d$'\t' -f3)
+
+  [[ -z "$session_id" ]] && die "no session selected"
+
+  # Check if directory exists
+  if [[ ! -d "$directory" ]]; then
+    echo -e "${YELLOW}warning:${RESET} directory $directory no longer exists"
+    echo -e "Opening session in current directory instead..."
+    directory="."
+  fi
+
+  # Fork or continue?
+  local fork_flag=""
+  if [[ "$key" == "ctrl-f" ]]; then
+    fork_flag="--fork"
+    echo -e "${CYAN}Forking${RESET} session ${DIM}${session_id}${RESET}..."
+  else
+    echo -e "${GREEN}Resuming${RESET} session ${DIM}${session_id}${RESET}..."
+  fi
+
+  echo -e "${DIM}cd ${directory}${RESET}"
+
+  # Open opencode in the session's directory with the session ID
+  cd "$directory"
+  exec opencode --session "$session_id" $fork_flag
+}
+
+# ── Main ──────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  -h|--help|help)
+    cmd_help
+    ;;
+  ls|list)
+    shift
+    cmd_list "${1:-}"
+    ;;
+  preview)
+    shift
+    session_preview "${1:-}"
+    ;;
+  *)
+    cmd_search "${1:-}"
+    ;;
+esac
